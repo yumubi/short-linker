@@ -18,11 +18,20 @@ import io.vertx.sqlclient.Tuple
 class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
     private lateinit var appConfig: Config
     private lateinit var sqlClient: SqlClient
+    private lateinit var cacheService: RedisCacheService
+    private lateinit var rateLimitService: RateLimitService
+    private lateinit var urlValidator: UrlValidationService
+    private lateinit var metricsService: MetricsService
 
     private val logger = LoggerFactory.getLogger(MainVerticle::class.java)
 
     override suspend fun start() {
         appConfig = Config()
+
+        cacheService = RedisCacheService(vertx, appConfig)
+        rateLimitService = RateLimitService()
+        urlValidator = UrlValidationService()
+        metricsService = MetricsService()
 
         val poolOptions = PoolOptions()
             .setMaxSize(5)
@@ -54,6 +63,9 @@ class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
         val router = Router.router(vertx)
         router.route().handler(BodyHandler.create())
 
+        metricsService.setupMetricsEndpoint(router)
+
+
         setupRoutes(router)
 
         vertx.createHttpServer()
@@ -67,6 +79,33 @@ class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
 
     private fun setupRoutes(router: Router) {
 
+
+        router.route().handler { ctx ->
+
+            metricsService.recordRequest()
+
+            val clientIp = ctx.request().remoteAddress().host()
+            val rateLimiter = rateLimitService.getRateLimiter(clientIp)
+
+            if (!rateLimiter.acquirePermission()) {
+                metricsService.recordRateLimitHit()
+
+                ctx.response()
+                    .setStatusCode(429)
+                    .putHeader("content-type", "application/json")
+                    .end(json {
+                        obj(
+                            "error" to "Too many requests",
+                            "retry_after" to "60"
+                        )
+                    }.encode())
+                return@handler
+            }
+            ctx.next()
+        }
+
+
+
         router.post("/new").coHandler { ctx ->
             val form = ctx.request().formAttributes()
             val url = form.get("url")
@@ -77,6 +116,16 @@ class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
                     .end("url is required")
                 return@coHandler
             }
+
+            if (!urlValidator.isValidUrl(url)) {
+                ctx.response()
+                    .setStatusCode(400)
+                    .end(json {
+                        obj("error" to "Invalid URL provided")
+                    }.encode())
+                return@coHandler
+            }
+
 
             logger.info("url: $url")
 
@@ -103,15 +152,16 @@ class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
                     .execute(Tuple.of(id, url, shortPath))
                     .onFailure { e -> logger.error("Failed to insert url", e) }
                     .coAwait()
-
-
-        } catch (e: Exception) {
+            } catch (e: Exception) {
                 logger.error("Failed to insert url", e)
                 ctx.response()
                     .setStatusCode(500)
                     .end("Failed to insert url")
                 return@coHandler
-        }
+            }
+
+            cacheService.set(shortPath, url)
+
             ctx.response()
                 .putHeader("content-type", "application/json")
                 .end(json {
@@ -121,12 +171,26 @@ class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
 
 
         router.get("/*").coHandler { ctx ->
-            val path = ctx.request().path().substring(2)
-            logger.info("Path: $path")
+            val shortPath = ctx.request().path().substring(2)
+            logger.info("shortPath: $shortPath")
+
+            val cachedUrl = cacheService.get(shortPath)
+            if (cachedUrl != null) {
+                metricsService.recordCacheHit()
+
+                ctx.response()
+                    .setStatusCode(301)
+                    .putHeader("Location", cachedUrl)
+                    .end()
+                return@coHandler
+            }
+
+            metricsService.recordCacheMiss()
+
            val result = sqlClient.preparedQuery(
                 "SELECT original_url FROM short_urls WHERE short_path = $1"
             )
-                .execute(Tuple.of(path))
+                .execute(Tuple.of(shortPath))
                 .coAwait()
 
 
@@ -137,6 +201,7 @@ class MainVerticle : CoroutineVerticle(), CoroutineRouterSupport {
 
 
             val originalUrl = result.first().getString("original_url")
+            cacheService.set(shortPath, originalUrl)
             logger.info("Redirecting to $originalUrl")
             ctx.response()
                 .setStatusCode(301)

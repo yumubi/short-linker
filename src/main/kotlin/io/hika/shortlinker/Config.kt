@@ -10,7 +10,10 @@ data class Config(
     val dbPort: Int = System.getenv("DB_PORT")?.toInt() ?: 5432,
     val dbName: String = System.getenv("DB_NAME") ?: "urlshortener",
     val dbUser: String = System.getenv("DB_USER") ?: "postgres",
-    val dbPassword: String = System.getenv("DB_PASSWORD") ?: "postgres"
+    val dbPassword: String = System.getenv("DB_PASSWORD") ?: "postgres",
+    val redisUrl: String = System.getenv("REDIS_URL") ?: "redis://host:6379/4",
+    val redisPassword: String = System.getenv("REDIS_PASSWORD") ?: "password",
+    val rateLimit: RateLimitConfig = RateLimitConfig(),
 ) {
     fun toJson() = JsonObject().apply {
         put("host", host)
@@ -23,3 +26,9 @@ data class Config(
         put("db_password", dbPassword)
     }
 }
+
+data class RateLimitConfig(
+    val enabled: Boolean = true,
+    val requestsPerMinute: Int = 10,
+    val timeoutSeconds: Int = 1
+)
